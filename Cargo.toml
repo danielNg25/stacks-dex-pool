@@ -1,0 +1,95 @@
+[package]
+name = "stacks-dex-pools"
+version = "0.1.0"
+edition = "2021"
+authors = ["Daniel <danielng25010@gmail.com>"]
+license = "MIT"
+description = "Stacks DEX pool implementations — Bitflow DLMM first-class; V2-family + StableSwap behind opt-in `non_dlmm` feature"
+repository = "https://github.com/danielNg25/stacks-dex-pool"
+readme = "README.md"
+keywords = ["stacks", "dex", "bitflow", "dlmm", "amm"]
+categories = ["finance", "cryptography::cryptocurrencies"]
+# Drop the internal handoff doc and Cargo.lock.fragment so the published
+# crate carries only the runtime artifacts. `target/` is excluded by
+# Cargo's defaults; this clause adds the project-specific noise.
+exclude = [
+    "HANDOFF_ARB_STACKS_DLMM.md",
+    "Cargo.toml.fragment",
+    ".github/",
+]
+
+[features]
+default = []
+# Adds HTTP RPC client (call-read with optional tip, retry on 429) and event-endpoint client.
+rpc = ["dep:reqwest", "dep:tokio", "dep:async-trait", "dep:futures-util"]
+# Adds DashMap-backed PoolRegistry with per-pool tokio RwLock and atomic block cursor.
+registry = ["dep:dashmap", "dep:tokio"]
+# Event-polling collector: per-contract REST poll tasks, bounded dedup queue, dispatcher.
+collector = [
+    "registry",
+    "rpc",
+    "dep:async-trait",
+    "dep:futures-util",
+]
+# Non-DLMM DEX support: ALEX / Velar / Arkadiko / Bitflow XYK / Bitflow V1+V2
+# StableSwap. Includes per-DEX math, event handlers, RPC fetchers, and STX-wrap
+# canonicalisation. The byte-exact math fixtures live here. DLMM-only consumers
+# (e.g. `arb-stacks` under the current architecture, where V2/stable use direct
+# RPC reserve fetches in their own crate) should NOT enable this — the module
+# tree won't even compile in.
+non_dlmm = []
+# Block-walking event source: walks `/extended/v2/blocks/{h}/transactions`
+# forward from a cursor and does a per-tx follow-up to `/extended/v1/tx/{tx_id}`
+# for events (Hiro's block-list endpoint always returns `events: []` despite
+# populating `event_count`, so the follow-up is required). Cost is O(active
+# event-tx per block), not O(pools). Currently OFF by default — the
+# per-contract source covers all known use cases at the current pool count.
+block_walking = []
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+once_cell = "1.19"
+
+# `rpc` feature
+reqwest = { version = "0.12", features = ["json"], optional = true }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "signal"], optional = true }
+
+# `registry` feature
+dashmap = { version = "6.1", optional = true }
+
+# `collector` feature
+async-trait = { version = "0.1", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+# Used by the binaries / examples for default-info logger setup; small and
+# widely-used so cheap to keep as a regular dep.
+env_logger = "0.11"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+serde_json = "1.0"
+
+[[bin]]
+name = "test_all_dlmm"
+path = "src/bin/test_all_dlmm.rs"
+required-features = ["collector"]
+
+[[bin]]
+name = "test_all_pools"
+path = "src/bin/test_all_pools.rs"
+required-features = ["collector", "non_dlmm"]
+
+[[example]]
+name = "quote_dlmm"
+path = "examples/quote_dlmm.rs"
+required-features = ["rpc"]
+
+[[example]]
+name = "discover_dlmm"
+path = "examples/discover_dlmm.rs"
+required-features = ["rpc"]
