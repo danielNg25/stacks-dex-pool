@@ -1,241 +1,244 @@
 # stacks-dex-pools
 
-Reusable Rust pool-state mirror library for Stacks DEXes — peer of
-[`evm-dex-pool`](https://github.com/danielng25/evm-dex-pool) in architecture,
-adapted for Stacks specifics.
+[![crates.io](https://img.shields.io/crates/v/stacks-dex-pools.svg)](https://crates.io/crates/stacks-dex-pools)
+[![docs.rs](https://docs.rs/stacks-dex-pools/badge.svg)](https://docs.rs/stacks-dex-pools)
+[![license](https://img.shields.io/crates/l/stacks-dex-pools.svg)](LICENSE)
 
-**Bitflow DLMM (HODLMM) is first-class.** Uniswap V2 family (ALEX / Velar /
-Arkadiko / Bitflow XYK) and Bitflow V1/V2 StableSwap are stubbed — type
-definitions present, math marked `TODO(stacks-port):` with pointers to the
-reference Python POC at `../test/`.
+Quote-ready in-memory mirror of Stacks DEX pool state. Bootstraps once
+from on-chain `(read-only fn)` calls, then keeps itself fresh via an
+event-poll loop so callers can quote any pool without an RPC round-trip
+on the hot path.
 
-## Why
+Bitflow DLMM (HODLMM) is the first-class venue — the bin-based mirror is
+the reason this library exists. ALEX, Velar, Arkadiko, Bitflow V2 XYK,
+and Bitflow V1/V2 StableSwap are also implemented (behind the `non_dlmm`
+feature) with byte-exact `get-dy` math.
 
-`arbitrage-rs` already mirrors EVM pool state via `evm-dex-pool` so it can
-quote without re-fetching on every scan. The Stacks side needs the same
-shape so DLMM pools (1001 bins per pool — re-reading per quote isn't an
-option) stay quote-ready, and so V2/StableSwap variants slot in later
-without reworking the integration.
+## Why a mirror
 
-The library design follows three principles from the EVM version:
+DLMM pools have up to 1001 bins; quoting a single swap walks multiple
+bins of `(x, y)` inventory. Refetching the full bin state on every quote
+makes any meaningful arbitrage or pricing loop unworkable. This crate
+solves that by:
 
-- **Pool math is event-driven, not poll-on-quote.** Quotes read from a local
-  mirror; the collector keeps the mirror in sync.
-- **Reads and writes are separated by a per-pool `tokio::RwLock`.** Quote
-  callers and event applicators don't contend on the registry; they only
-  contend on the specific pool they touch.
-- **Per-protocol implementations behind a single `PoolInterface` trait.**
-  The collector and registry don't know the difference between a DLMM bin
-  pool and a Uniswap-V2 reserve pair.
+- **Bootstrapping once** — fetch all 1001 bins via chunked multicall (~12 s/pool
+  on `https://node.bitflowapis.finance`).
+- **Mirroring events** — a per-contract event poller applies on-chain
+  `update-bin-balances` / `swap-x-for-y` / fee changes to the local
+  mirror as they land.
+- **Quoting locally** — `pool.quote_x_for_y(amount)` is a pure-`u128`
+  walk of the local `BTreeMap<bin_id, BinState>`. No I/O.
 
-## Layout
-
-```
-src/
-├── codec/                    # Clarity value + c32 address codec (default feature, no deps)
-├── pool/                      # Principal, PoolInterface, StacksEvent, StacksTopic
-├── rpc/                       # HTTP RPC client + events endpoint (feature `rpc`)
-├── token_info.rs              # TokenInfo trait + decimals cache (feature `rpc`)
-├── dlmm/                      # Bitflow DLMM — full implementation
-├── v2/                        # Stub for ALEX / Velar / Arkadiko / Bitflow XYK
-├── stableswap/                # Stub for Bitflow V1/V2 stableswap
-├── registry.rs                # PoolRegistry (DashMap + tokio::RwLock) (feature `registry`)
-└── collector/                 # Event poll lifecycle (feature `collector`)
-
-tests/
-├── codec_roundtrip.rs         # Clarity encode/decode roundtrip + real event shapes
-├── dlmm_math_fixtures.rs      # Hand-computed swap math fixtures
-├── dlmm_event_apply.rs        # Cross-pool filter correctness (THE critical test)
-└── dlmm_reconcile_live.rs     # `#[ignore]` — tip-and-replay against live Hiro
-
-examples/
-└── quote_dlmm.rs              # Bootstrap a pool and quote
-```
-
-## Feature tiers
-
-Matches `evm-dex-pool` so consumers can drag in only what they need:
-
-| Feature | Adds | Use case |
-|---|---|---|
-| `default` | Pool math + Clarity/c32 codec | Embed quote math in another tool |
-| `rpc` | HTTP client (reqwest), `?tip=` historical reads, events fetch, decimals cache | One-shot quoting from chain |
-| `registry` | DashMap-backed `PoolRegistry` with per-pool RwLock | Multi-pool in-memory state |
-| `collector` | Per-contract event polling tasks, dedup queue, dispatcher | Production: live mirror |
-
-Each tier is additive (`collector` implies `registry` + `rpc`).
+The V2-family / StableSwap variants don't need 1001 bins, but they fit
+the same `PoolInterface` trait and share the same collector — useful
+when an application tracks both DLMM and constant-product pools.
 
 ## Quick start
 
-### End-to-end collector test (bootstrap + run live):
-
-```bash
-# Single pool, fast feedback (~15s bootstrap + your --duration):
-cargo run --bin test_all_dlmm --features collector -- \
-    --pool dlmm-pool-stx-usdcx-v-1-bps-10 \
-    --rpc-host https://node.bitflowapis.finance \
-    --duration 120 --log-interval 10 --poll-interval 5
-
-# All 8 pools (~75s bootstrap + your --duration):
-cargo run --bin test_all_dlmm --features collector -- \
-    --rpc-host https://node.bitflowapis.finance \
-    --duration 300 --log-interval 15
-
-# Bootstrap + one quote snapshot only, no live collector:
-cargo run --bin test_all_dlmm --features collector -- \
-    --pool dlmm-pool-stx-usdcx-v-1-bps-10 --duration 0
+```toml
+[dependencies]
+stacks-dex-pools = { version = "0.1", features = ["collector"] }
 ```
 
-What it does:
-
-1. **Bootstrap in FULL mode** — fetches all 1001 bins per pool via the
-   chunked multicall helper (`dlmm-pool-multi-helper-v-1-1.get-bin-balances-multi`).
-   ~11 chunked calls (chunks of 100) × ~1s each ≈ 10-14s per pool. Quotes are
-   accurate at any size. The slower per-bin fallback (`BootstrapMode::FullPerBin`)
-   remains available for environments where the helper is unreachable.
-2. **Insert into a `PoolRegistry` and start the collector.** The collector
-   polls every contract in the topic set (each pool's contract + the shared
-   core engine) and applies events to the mirror.
-3. **Loop: every `--log-interval` seconds, log per-pool status:**
-   `active_bin`, `bin_count`, event watermark, and the current quote for a
-   fixed input. If chain state drifts during the run (someone swaps, an LP
-   adds/removes), the line will show `Δ active …→…` and `Δ quote …`.
-
-Example output:
-
-```
-[bootstrap] STX→USDCx-10   active= -26 bin_step= 10bps non_empty_bins=1001 fees(x→y)= 30bps 50.9s
-[baseline]
-  STX→USDCx-10   active= -26 bins=1001 wm=(none)         |   100.0000 →      26.675322
-[collector] starting — poll_interval=5s, events host = https://api.mainnet.hiro.so
-
-[t+ 10s]
-  STX→USDCx-10   active= -26 bins=1001 wm=0x0668566c70…  |   100.0000 →      26.675322
-
-[t+ 20s]
-  STX→USDCx-10   active= -27 bins=1001 wm=0x9a3def…       |   100.0000 →      26.671004  Δ active -26→-27 Δ quote -4318
-```
-
-When `Δ` arrows show up, that's the collector applying real on-chain events
-to the local mirror. Use `--duration 600` or longer to give the active pool
-time to actually trade.
-
-### Quote one pool live (custom amounts):
-
-```bash
-cargo run --example quote_dlmm --features rpc -- 100
-```
-
-Output:
-
-```
-Bootstrapping SM1FKXGN….dlmm-pool-stx-usdcx-v-1-bps-10 (±10 bin window)…
-  active bin -37, x_decimals=6, y_decimals=6, bins mirrored=15
-  fees (x→y): protocol=15 provider=15 variable=0 (total 30 bps)
-
-          STX in        USDCx out  eff price (USD/STX)
-          ------       ---------   -------------------
-      100.000000        27.012345          0.27012345
-```
-
-### Full event-driven mirror (all features):
+Bootstrap one pool and quote it live:
 
 ```rust
 use std::sync::Arc;
-use stacks_dex_pools::{
-    PoolRegistry, start_collector, CollectorConfig,
-    dlmm::fetcher::{fetch_dlmm_pool, BootstrapMode},
-    rpc::client::{StacksRpcClient, RpcConfig},
-    token_info::StacksTokenInfo,
-};
+use stacks_dex_pools::dlmm::fetcher::{fetch_dlmm_pool, BootstrapMode};
+use stacks_dex_pools::pool::principal::Principal;
+use stacks_dex_pools::rpc::client::{RpcConfig, StacksRpcClient};
+use stacks_dex_pools::token_info::StacksTokenInfo;
 
-let client = Arc::new(StacksRpcClient::new(RpcConfig::default())?);
+# async fn run() -> anyhow::Result<()> {
+let client = Arc::new(StacksRpcClient::new(RpcConfig {
+    base_url: "https://node.bitflowapis.finance".to_string(),
+    ..Default::default()
+})?);
 let token_info = StacksTokenInfo::new(client.clone());
-let registry = Arc::new(PoolRegistry::new());
+
+let pool_contract: Principal =
+    "SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-pool-stx-usdcx-v-1-bps-10".parse()?;
+let core_contract: Principal =
+    "SP1PFR4V08H1RAZXREBGFFQ59WB739XM8VVGTFSEA.dlmm-core-v-1-1".parse()?;
 
 let pool = fetch_dlmm_pool(
-    client.clone(),
-    &"SM1FKXGN….dlmm-pool-stx-usdcx-v-1-bps-10".parse()?,
-    &"SP1PFR4V….dlmm-core-v-1-1".parse()?,
+    client,
+    &pool_contract,
+    &core_contract,
     &token_info,
-    BootstrapMode::default(),
-    8,
-    None,
+    BootstrapMode::default(), // Full: all 1001 bins, ~12 s
+    8,                        // parallelism for per-bin fallback
+    None,                     // tip = current
 ).await?;
+
+// Quote: 100 STX in → ? USDCx out (both 6-decimal).
+let (dy, _last_bin, _exhausted) = pool.quote_x_for_y(100_000_000);
+println!("100 STX → {:.6} USDCx", dy as f64 / 1_000_000.0);
+# Ok(()) }
+```
+
+For a full event-driven mirror across multiple pools, use the collector:
+
+```rust,no_run
+use std::sync::Arc;
+use stacks_dex_pools::{
+    pool::base::PoolInterface,
+    registry::PoolRegistry,
+    collector::{start_collector, CollectorConfig},
+};
+
+# async fn run(pool: impl PoolInterface + Send + Sync + 'static) -> anyhow::Result<()> {
+let registry = Arc::new(PoolRegistry::new());
 registry.insert(Box::new(pool));
 
 let handle = start_collector(
-    "https://api.mainnet.hiro.so".to_string(),
+    "https://api.mainnet.hiro.so".to_string(), // Hiro events host
     registry.clone(),
     CollectorConfig::default(),
-    None,
+    None, // optional metrics hook
 ).await?;
-// ... quote loop ...
+
+// Quote any registered pool by id without hitting the network.
+// Events apply automatically in the background.
+
 handle.stop().await;
+# Ok(()) }
 ```
 
-## Key differences from evm-dex-pool
+Runnable end-to-end demo (after `git clone`):
 
-| EVM | Stacks |
-|---|---|
-| `Address` (`[u8; 20]`) | `Principal` (Standard or Contract) |
-| `U256` for amounts | `u128` (Clarity uint is 128-bit) |
-| `FixedBytes<32>` topic (Keccak hash) | `StacksTopic { contract, action_name }` |
-| WebSocket log subscription | REST polling (Stacks RPC has no push) |
-| `eth_getLogs` filter by address+topic | URL is per-contract; filter after decode |
-| `blockNumber` parameter | `?tip=<index_block_hash>` query string |
-| Multicall3 for batched reads | Parallelize with `futures::stream::buffer_unordered` |
-| Events carry `blockNumber` inline | Hiro returns only `(tx_id, event_index)` — block via `/extended/v1/tx/<tx_id>` |
+```bash
+# Quote one DLMM pool, live:
+cargo run --example quote_dlmm --features rpc -- 100
 
-## The cross-pool filter — read this before changing event handling
+# Discover every live DLMM pool via the on-chain registry:
+cargo run --example discover_dlmm --features rpc
 
-Bitflow's DLMM has a **shared core contract** (`dlmm-core-v-1-1`) that runs the
-swap math for every DLMM pool. When the core emits a `swap-x-for-y` event, it
-emits it on the core's contract address — every pool sharing that core sees
-the same event in its core-contract event stream.
+# Full collector loop across all DLMM pools, logs Δ on each event:
+cargo run --bin test_all_dlmm --features collector -- \
+    --rpc-host https://node.bitflowapis.finance \
+    --duration 300 --log-interval 15
+```
 
-Without filtering, applying any swap event would mutate every mirrored pool's
-`active_bin_id`. That bug was the original cause of "DLMM quotes don't match
-the FE" in the Python POC; the fix is at the top of
-[`dlmm::events::apply_event`](src/dlmm/events.rs): drop any event whose
-`pool-contract` data field doesn't match the pool's own contract. Pool-emitted
-events (`update-bin-balances*`) lack this field — they're implicitly scoped
+## Feature flags
+
+| Feature | Adds | When to enable |
+|---|---|---|
+| `default` | Pure pool math (`quote_x_for_y` etc.) + Clarity/c32 codec, no I/O | Embed quote math in another tool, run unit tests |
+| `rpc` | HTTP client (reqwest), `?tip=` historical reads, decimals cache | One-shot quoting from chain |
+| `registry` | DashMap-backed `PoolRegistry` with per-pool `tokio::RwLock` | Hold many pools in one process |
+| `collector` | Per-contract event polling tasks, bounded dedup queue, dispatcher | Production: keep mirrors fresh |
+| `non_dlmm` | ALEX / Velar / Arkadiko / Bitflow XYK + V1/V2 stable math | You quote non-DLMM Bitflow pools too |
+| `block_walking` | Block-walking event source (single cursor across all pools) | Tracking many pools cheaply at the cost of one extra RPC per event-bearing tx |
+
+Tiers are additive: `collector` implies `registry` + `rpc`.
+
+## What's mirrored
+
+| DEX family | Status | Feature | Source of truth |
+|---|---|---|---|
+| Bitflow DLMM | ✅ first-class, event-driven | always on | `dlmm-core-v-1-1` |
+| Bitflow V2 XYK | ✅ full math + events | `non_dlmm` | `xyk-core-v-1-X` |
+| Bitflow V2 StableSwap | ✅ full math + events | `non_dlmm` | `stableswap-core-v-1-X` |
+| Bitflow V1 StableSwap | ✅ full math + events (dual ABI, dual variant) | `non_dlmm` | per-pool `get-pair-data` |
+| ALEX | ✅ `gmmm-dy` math + events | `non_dlmm` | `amm-pool-v2-01` |
+| Velar | ✅ V2 math + events | `non_dlmm` | `univ2-core` |
+| Arkadiko | ✅ V2 math (hardcoded 30 bps) + events | `non_dlmm` | `arkadiko-swap-v2-1` |
+
+Every pool type implements the same `PoolInterface` trait, so the
+collector and registry treat them uniformly.
+
+## The cross-pool filter (read this if you touch event handling)
+
+Bitflow's DLMM has a **shared core contract** (`dlmm-core-v-1-1`) that
+runs the swap math for every DLMM pool. When the core emits a
+`swap-x-for-y` event, it emits it on the core's contract address —
+every pool sharing that core sees the same event in its core-contract
+event stream.
+
+Without filtering, applying any swap event would mutate every mirrored
+pool's `active_bin_id`. The filter at the top of
+`dlmm::events::apply_event` drops any event whose `pool-contract`
+data field doesn't match the pool's own contract. Pool-emitted events
+(`update-bin-balances*`) lack this field — they're implicitly scoped
 by the event-stream URL — and pass through.
 
-The test `tests/dlmm_event_apply.rs::swap_event_for_other_pool_is_filtered_out`
+The test
+`tests/dlmm_event_apply.rs::swap_event_for_other_pool_is_filtered_out`
 guards against regressions; it builds a swap event with someone else's
-`pool-contract` and asserts our pool's `active_bin_id` doesn't move.
+`pool-contract` and asserts the local pool's `active_bin_id` doesn't
+move.
 
-## What's NOT implemented
+The same pattern applies to V2 XYK and V2 StableSwap (shared core
+contracts) — see `v2::events` and `stableswap::events`.
 
-- **`shares` field on bins** — intentional. Quote math never reads it; LP
-  ownership simulation is the only consumer, and we don't have one. See
-  `NOTES_bitflow_dlmm.md §12` in the POC.
-- **V2 family math** — stubs only. Reference impls live in the POC's
-  `test/fetch_alex_pools.py`, `fetch_velar_pools.py`, `fetch_arkadiko_pools.py`,
-  `fetch_bitflow_pools.py`.
-- **StableSwap math** — stubs only. Reference: `test/fetch_bitflow_pools.py:103-190`
-  (V2 Curve), `test/fetch_bitflow_v1_pools.py` (V1).
-- **Reorg handling** — matches `evm-dex-pool`'s posture: caller's
-  responsibility (detect, refetch).
-- **Multi-hop routing** — that belongs in `arbitrage-rs::Route`, not here.
+## Discovery
+
+`dlmm-core-v-1-1` exposes a built-in pool registry; the crate ships an
+async walker that enumerates every live DLMM pool without hardcoding
+addresses:
+
+```rust,no_run
+use std::sync::Arc;
+use stacks_dex_pools::dlmm::discover_dlmm_pools;
+use stacks_dex_pools::pool::principal::Principal;
+use stacks_dex_pools::rpc::client::{RpcConfig, StacksRpcClient};
+
+# async fn run() -> anyhow::Result<()> {
+let client = Arc::new(StacksRpcClient::new(RpcConfig::default())?);
+let core: Principal = "SP1PFR4V08H1RAZXREBGFFQ59WB739XM8VVGTFSEA.dlmm-core-v-1-1".parse()?;
+let listings = discover_dlmm_pools(client, &core, 8, None).await?;
+for l in listings {
+    println!("{}  {}  status={}", l.id, l.pool_contract, l.status);
+}
+# Ok(()) }
+```
 
 ## Tests
 
+```bash
+cargo test                              # offline default-feature tests
+cargo test --features rpc               # + token_info / RPC tests
+cargo test --features registry          # + registry tests
+cargo test --all-features               # full offline suite
+cargo test --all-features -- --ignored  # + live reconcile against mainnet
 ```
-cargo test                              # 22 unit + 27 integration (offline)
-cargo test --features rpc               # + token_info::cache_lookup_short_circuits
-cargo test --features registry          # + 4 registry tests
-cargo test --all-features               # 49 total
-cargo test --all-features -- --ignored  # + tests/dlmm_reconcile_live (live Hiro)
+
+The live reconcile test snapshots a pool at `current_tip - lookback`,
+replays events forward to tip, and asserts every quote-relevant field
+matches a fresh fetch at tip. 100% match required — that's the
+correctness gate the event-handling code is held to.
+
+## Repository layout
+
+```
+src/
+├── codec/        # Clarity value + c32 address codec (no deps, always on)
+├── pool/         # Principal, PoolInterface, StacksEvent, StacksTopic
+├── rpc/          # HTTP RPC client + events endpoint (`rpc`)
+├── token_info.rs # SIP-010 decimals cache (`rpc`)
+├── dlmm/         # Bitflow DLMM — full impl, always on
+├── v2/           # ALEX / Velar / Arkadiko / Bitflow XYK (`non_dlmm`)
+├── stableswap/   # Bitflow V1/V2 stableswap (`non_dlmm`)
+├── registry.rs   # PoolRegistry (`registry`)
+└── collector/    # Event poller + dispatcher (`collector`)
+
+tests/
+├── codec_roundtrip.rs       # Clarity encode/decode + real event shapes
+├── dlmm_math_fixtures.rs    # Hand-computed swap math fixtures
+├── dlmm_event_apply.rs      # Cross-pool filter correctness — critical
+└── dlmm_reconcile_live.rs   # `#[ignore]` — tip-and-replay against mainnet
 ```
 
-Live reconcile runs the Rust port of `test/verify_dlmm_events.py`: snapshot
-at `current_tip - lookback`, replay events to tip, compare quote-relevant
-fields. 100% match required.
+## Out of scope
 
-## Pointers
+- **Reorg handling.** Stacks reorgs are rare and shallow; on a detected
+  reorg the caller should re-fetch affected pools rather than try to
+  rewind events.
+- **Multi-hop routing.** This library quotes a single pool. Composing
+  pools into routes belongs upstream.
+- **Trade execution.** Read-only mirror; no transaction construction.
 
-- Python POC: `../test/` (full byte-exact reference)
-- Architectural notes: `../test/NOTES_bitflow_dlmm.md` (12 sections, every gotcha)
-- Handoff: `../test/HANDOFF_STACKS.md` (broader Stacks-side context)
+## License
+
+[MIT](LICENSE)
